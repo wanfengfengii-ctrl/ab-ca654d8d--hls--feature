@@ -1,7 +1,7 @@
 import unittest
 
 from app.errors import ApiError
-from app.normalize import SegmentInput, normalize_segments, unwrap_map_positions
+from app.normalize import DiscontinuityAnchor, SegmentInput, normalize_segments, unwrap_map_positions
 from app.webvtt import MPEGTS_MODULUS as MOD, parse_segment
 
 
@@ -52,6 +52,102 @@ class UnwrapTest(unittest.TestCase):
         segments = [make_segment(0, 100), make_segment(1, MOD - 5)]
         expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
                     100, 1000, segments)
+
+
+class DiscontinuityTest(unittest.TestCase):
+    def test_anchor_starts_new_region_without_adjacency_window(self):
+        # Segments 0..1 wrap normally; an encoder restart at segment 2
+        # restarts the MPEGTS epoch at a small value.
+        segments = [
+            make_segment(0, 8589930000),
+            make_segment(1, 3000),
+            make_segment(2, 1000),
+            make_segment(3, 2000),
+        ]
+        new_epoch = 3 * MOD + 1000  # arbitrary absolute position of the restart
+        positions = unwrap_map_positions(
+            8589930000,
+            900000,
+            segments,
+            [DiscontinuityAnchor(2, new_epoch)],
+        )
+        self.assertEqual(positions, [8589930000, MOD + 3000, new_epoch, 3 * MOD + 2000])
+
+    def test_region_after_restart_unwraps_by_unique_window(self):
+        # Inside the new epoch the clock keeps wrapping; the segment after
+        # the anchor must again land in the unique window.
+        segments = [
+            make_segment(0, 0),
+            make_segment(1, MOD - 9000),
+            make_segment(2, 9000),
+        ]
+        anchor = 5 * MOD + (MOD - 9000)
+        positions = unwrap_map_positions(
+            0, 18000, segments, [DiscontinuityAnchor(1, anchor)]
+        )
+        self.assertEqual(positions, [0, anchor, 6 * MOD + 9000])
+
+    def test_within_region_gap_beyond_interval_still_incompatible(self):
+        segments = [make_segment(0, 0), make_segment(1, 90000), make_segment(2, 900000)]
+        err = expect_code(
+            self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+            0, 90000, segments, [DiscontinuityAnchor(1, MOD + 90000)],
+        )
+        self.assertEqual(err.segment, 2)
+
+    def test_within_region_ambiguous_unwrap_still_rejected(self):
+        segments = [make_segment(0, 0), make_segment(1, 0), make_segment(2, MOD // 2)]
+        err = expect_code(
+            self, "UNWRAP_NOT_UNIQUE", unwrap_map_positions,
+            MOD, MOD // 2, segments, [DiscontinuityAnchor(1, 2 * MOD)],
+        )
+        self.assertEqual(err.segment, 2)
+
+    def test_discontinuity_anchor_must_match_segment_mpegts(self):
+        segments = [make_segment(0, 0), make_segment(1, 12345)]
+        err = expect_code(
+            self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+            0, 90000, segments, [DiscontinuityAnchor(1, 2 * MOD)],
+        )
+        self.assertEqual(err.segment, 1)
+
+    def test_discontinuity_anchor_must_be_later_than_previous_map_point(self):
+        # The pinned restart position is at/before the already-fixed
+        # pre-restart map point: the timeline would go backwards.
+        segments = [make_segment(0, 100), make_segment(1, 200)]
+        err = expect_code(
+            self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+            10 * MOD + 100, 90000, segments, [DiscontinuityAnchor(1, 200)],
+        )
+        self.assertEqual(err.segment, 1)
+
+    def test_multiple_regions(self):
+        segments = [
+            make_segment(0, 10),
+            make_segment(1, 20),
+            make_segment(2, 30),
+            make_segment(3, 40),
+        ]
+        positions = unwrap_map_positions(
+            10, 90000, segments,
+            [DiscontinuityAnchor(1, 7 * MOD + 20), DiscontinuityAnchor(3, 11 * MOD + 40)],
+        )
+        self.assertEqual(positions, [10, 7 * MOD + 20, 7 * MOD + 30, 11 * MOD + 40])
+
+    def test_cues_stay_ordered_across_restart(self):
+        segments = [
+            make_segment(0, 8589930000, cues=[("00:00:00.000", "00:00:00.400", "pre-restart")]),
+            make_segment(1, 1000, local="00:00:00.000",
+                         cues=[("00:00:00.100", "00:00:01.000", "post-restart")]),
+        ]
+        new_epoch = 10 * MOD + 1000
+        cues = normalize_segments(
+            8589930000, 900000, segments, [DiscontinuityAnchor(1, new_epoch)]
+        )
+        self.assertEqual([c.text for c in cues], ["pre-restart", "post-restart"])
+        self.assertEqual((cues[0].start_ticks, cues[0].end_ticks), (8589930000, 8589966000))
+        self.assertEqual(cues[1].start_ticks, new_epoch + 9000)
+        self.assertLess(cues[0].end_ticks, cues[1].start_ticks)
 
 
 class NormalizeTest(unittest.TestCase):

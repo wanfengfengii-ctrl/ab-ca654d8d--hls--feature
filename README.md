@@ -20,6 +20,9 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `segments` | 数组，1–64 个 | 字幕段，序号必须连续 |
 | `segments[].sequence` | 整数 ≥ 0 | 段序号 |
 | `segments[].content` | 字符串 | UTF-8 WebVTT 文本；全部段合计 ≤ 1 MiB |
+| `discontinuityAnchors` | 数组，可省略，最多 8 项 | 编码器重启（MPEGTS 纪元重置）断点；省略时行为与原先完全一致 |
+| `discontinuityAnchors[].sequence` | 整数 ≥ 0 | 已有段的序号；各项序号须严格递增、不得重复，且不得指向首段 |
+| `discontinuityAnchors[].anchorTicks` | 整数 ≥ 0 | 该段映射点在统一绝对时间轴上的位置；必须满足 `anchorTicks ≡ MPEGTSₙ (mod 2³³)`，并严格晚于上一段已确定的映射点 |
 
 每个分段必须恰含一个位于头部块（首个空行之前）的
 `X-TIMESTAMP-MAP=LOCAL:<毫秒时间>,MPEGTS:<0..2³³-1>`。
@@ -46,6 +49,20 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 - 窗口内没有候选 → `ANCHOR_INCOMPATIBLE`；多于一个候选 → `UNWRAP_NOT_UNIQUE`；
 - 提示的绝对 tick = 段映射点位置 +（提示本地毫秒 − 映射 LOCAL 毫秒）× 90。
 
+### 编码器重启（不连续断点）
+
+编码器重启后会从新的 MPEGTS 纪元开始计时（数值通常回到很小的值），
+若把它接到重启前的回绕链上，后续字幕会被误排到节目开头。请求方可在
+`discontinuityAnchors` 中为每个重启后的首段给出绝对锚点：
+
+- 声明段的映射点直接钉在给定的 `anchorTicks` 上，并在此开启新的连续区段；
+- 跨断点**不**套用相邻间隔窗口：新纪元可位于统一时间轴上任意更晚的位置；
+- 新区段内部仍按 `maxAnchorIntervalTicks` 唯一展开（同样可能返回
+  `ANCHOR_INCOMPATIBLE` / `UNWRAP_NOT_UNIQUE`）；
+- 锚点必须与目标段 MPEGTS 在模 2³³ 下同余，且严格晚于上一段已确定的
+  映射点，否则返回 `ANCHOR_INCOMPATIBLE` 并携带该段序号；
+- 成功响应规则不变：所有区段的提示都投影到同一条统一绝对时间轴。
+
 ### 错误响应
 
 统一为 `400`，携带稳定错误码与（适用时的）段序号：
@@ -56,7 +73,7 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 
 | 错误码 | 含义 |
 | --- | --- |
-| `INVALID_REQUEST` | 请求体不是合法 JSON 对象或字段类型非法 |
+| `INVALID_REQUEST` | 请求体不是合法 JSON 对象或字段类型非法（含 `discontinuityAnchors` 字段格式、超过 8 项、序号未严格递增或重复、指向首段） |
 | `SEGMENT_COUNT_OUT_OF_RANGE` | 段数不在 1–64 |
 | `SEGMENTS_NOT_CONSECUTIVE` | 段序号不连续（含重复） |
 | `PAYLOAD_TOO_LARGE` | 全部段文本合计超过 1 MiB |
@@ -68,7 +85,8 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `MPEGTS_OUT_OF_RANGE` | MPEGTS 超出 33 位范围（0..8589934591） |
 | `CUE_TIMING_INVALID` | 提示块缺少或存在非法的 `-->` 计时行 |
 | `CUE_INTERVAL_INVALID` | 提示结束时间不大于开始时间 |
-| `ANCHOR_INCOMPATIBLE` | 锚点与首段 MPEGTS 不同余，或相邻段间隔超出上限无法衔接 |
+| `ANCHOR_INCOMPATIBLE` | 锚点与首段 MPEGTS 不同余，或相邻段间隔超出上限无法衔接；对 `discontinuityAnchors` 则为与目标段不同余，或锚点未严格晚于上一段已确定的映射点（时间倒退） |
+| `ANCHOR_TARGET_NOT_FOUND` | `discontinuityAnchors` 指向不存在的段（携带该锚点的 `sequence`） |
 | `UNWRAP_NOT_UNIQUE` | 回绕展开存在多个候选，无法唯一确定 |
 
 ### `GET /healthz`
@@ -85,8 +103,8 @@ APP_PORT=9090 docker compose up app    # 宿主机端口由环境变量配置
 ## 验证（一次性 verify 服务）
 
 `verify` 服务在应用健康检查后启动，依次执行：构建检查（全部源文件字节
-码编译）、单元测试、API 冒烟（含 2³³ 回绕样例与稳定错误码断言），并以
-退出码报告结果：
+码编译）、单元测试、API 冒烟（含 2³³ 回绕样例、编码器重启样例与稳定错误码
+断言），并以退出码报告结果：
 
 ```bash
 docker compose up --build --exit-code-from verify verify
@@ -107,7 +125,7 @@ APP_BASE_URL=http://127.0.0.1:8080 python3 -m app.verify  # 完整验证流水�
 app/
   main.py         HTTP 服务（路由、请求体限制、错误映射）
   webvtt.py       WebVTT 严格解析（头、X-TIMESTAMP-MAP、毫秒时间、提示区间）
-  normalize.py    33 位回绕唯一展开与提示排序
+  normalize.py    33 位回绕唯一展开、重启断点锚定与提示排序
   service.py      请求校验与编排（段数、序号、1 MiB 上限）
   healthcheck.py  容器健康检查
   verify.py       一次性验证流水线

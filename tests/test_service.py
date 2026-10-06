@@ -11,12 +11,15 @@ def segment(mpegts, local="00:00:00.000", cues=()):
     return "\n".join(lines)
 
 
-def request(segments, anchor=0, interval=900000):
-    return {
+def request(segments, anchor=0, interval=900000, anchors=None):
+    body = {
         "anchorTicks": anchor,
         "maxAnchorIntervalTicks": interval,
         "segments": [{"sequence": seq, "content": content} for seq, content in segments],
     }
+    if anchors is not None:
+        body["discontinuityAnchors"] = anchors
+    return body
 
 
 def expect_code(testcase, code, body):
@@ -70,6 +73,78 @@ class RequestValidationTest(unittest.TestCase):
         self.assertEqual(err.segment, 7)
 
 
+class DiscontinuityAnchorValidationTest(unittest.TestCase):
+    def test_omitting_field_keeps_legacy_behavior(self):
+        body = {
+            "anchorTicks": 0,
+            "maxAnchorIntervalTicks": 90000,
+            "segments": [{"sequence": 0, "content": segment(0)}],
+        }
+        result = normalize_request(body)
+        self.assertEqual(result["cues"], [])
+
+    def test_field_must_be_an_array(self):
+        expect_code(self, "INVALID_REQUEST",
+                    request([(0, segment(0))], anchors={"sequence": 1, "anchorTicks": 0}))
+
+    def test_at_most_eight_entries(self):
+        anchors = [{"sequence": i, "anchorTicks": 0} for i in range(1, 10)]
+        expect_code(self, "INVALID_REQUEST",
+                    request([(i, segment(0)) for i in range(10)], anchors=anchors))
+
+    def test_entry_must_be_an_object(self):
+        expect_code(self, "INVALID_REQUEST", request([(0, segment(0)), (1, segment(0))],
+                                                     anchors=[42]))
+
+    def test_required_fields(self):
+        expect_code(self, "INVALID_REQUEST",
+                    request([(0, segment(0)), (1, segment(0))], anchors=[{"sequence": 1}]))
+        expect_code(self, "INVALID_REQUEST",
+                    request([(0, segment(0)), (1, segment(0))], anchors=[{"anchorTicks": 0}]))
+
+    def test_anchor_ticks_must_be_non_negative_integer(self):
+        expect_code(self, "INVALID_REQUEST",
+                    request([(0, segment(0)), (1, segment(0))],
+                            anchors=[{"sequence": 1, "anchorTicks": -1}]))
+        expect_code(self, "INVALID_REQUEST",
+                    request([(0, segment(0)), (1, segment(0))],
+                            anchors=[{"sequence": 1, "anchorTicks": True}]))
+
+    def test_sequences_must_be_strictly_increasing(self):
+        err = expect_code(
+            self, "INVALID_REQUEST",
+            request([(0, segment(0)), (1, segment(0)), (2, segment(0))],
+                    anchors=[{"sequence": 2, "anchorTicks": 0},
+                             {"sequence": 1, "anchorTicks": 0}]),
+        )
+        self.assertEqual(err.segment, 1)
+
+    def test_sequences_must_be_unique(self):
+        err = expect_code(
+            self, "INVALID_REQUEST",
+            request([(0, segment(0)), (1, segment(0))],
+                    anchors=[{"sequence": 1, "anchorTicks": 0},
+                             {"sequence": 1, "anchorTicks": 0}]),
+        )
+        self.assertEqual(err.segment, 1)
+
+    def test_anchor_must_not_target_first_segment(self):
+        err = expect_code(
+            self, "INVALID_REQUEST",
+            request([(3, segment(0)), (4, segment(0))],
+                    anchors=[{"sequence": 3, "anchorTicks": 0}]),
+        )
+        self.assertEqual(err.segment, 3)
+
+    def test_target_segment_must_exist(self):
+        err = expect_code(
+            self, "ANCHOR_TARGET_NOT_FOUND",
+            request([(0, segment(0)), (1, segment(0))],
+                    anchors=[{"sequence": 5, "anchorTicks": 0}]),
+        )
+        self.assertEqual(err.segment, 5)
+
+
 class NormalizeRequestTest(unittest.TestCase):
     def test_happy_path_response_shape(self):
         body = request([
@@ -114,6 +189,42 @@ class NormalizeRequestTest(unittest.TestCase):
         err = expect_code(self, "UNWRAP_NOT_UNIQUE",
                           request([(0, segment(0)), (1, segment(1 << 32))],
                                   anchor=1 << 33, interval=1 << 32))
+        self.assertEqual(err.segment, 1)
+
+
+class DiscontinuityEndToEndTest(unittest.TestCase):
+    MOD = 1 << 33
+
+    def test_encoder_restart_stays_ordered(self):
+        body = request(
+            [
+                (0, segment(8589930000, cues=[("00:00:00.000", "00:00:00.400", "before restart")])),
+                (1, segment(5000, local="00:00:00.000",
+                            cues=[("00:00:00.200", "00:00:01.200", "after restart")])),
+            ],
+            anchor=8589930000,
+            anchors=[{"sequence": 1, "anchorTicks": 10 * self.MOD + 5000}],
+        )
+        result = normalize_request(body)
+        self.assertEqual([c["text"] for c in result["cues"]],
+                         ["before restart", "after restart"])
+        self.assertEqual(result["cues"][1]["startTicks"], 10 * self.MOD + 5000 + 18000)
+
+    def test_congruence_mismatch_returns_segment(self):
+        err = expect_code(
+            self, "ANCHOR_INCOMPATIBLE",
+            request([(0, segment(0)), (1, segment(12345))],
+                    anchors=[{"sequence": 1, "anchorTicks": 2 * self.MOD}]),
+        )
+        self.assertEqual(err.segment, 1)
+
+    def test_time_regression_returns_segment(self):
+        err = expect_code(
+            self, "ANCHOR_INCOMPATIBLE",
+            request([(0, segment(100)), (1, segment(200))],
+                    anchor=10 * self.MOD + 100,
+                    anchors=[{"sequence": 1, "anchorTicks": 200}]),
+        )
         self.assertEqual(err.segment, 1)
 
 

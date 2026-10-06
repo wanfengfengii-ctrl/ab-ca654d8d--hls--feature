@@ -6,7 +6,8 @@ order:
 1. build check -- every shipped source file byte-compiles;
 2. unit tests  -- the unittest suite under ``tests/``;
 3. API smoke   -- live HTTP calls against the running app, including an
-   MPEG-TS wraparound sample and the stable error codes.
+   MPEG-TS wraparound sample, an encoder-restart (fresh MPEGTS epoch)
+   sample and the stable error codes.
 
 Exits 0 when every step passes, 1 otherwise.
 """
@@ -125,6 +126,100 @@ def smoke_ambiguous_unwrap() -> str:
     return "ambiguous unwrap returns UNWRAP_NOT_UNIQUE"
 
 
+def smoke_encoder_restart() -> str:
+    """An encoder restart starts a fresh MPEGTS epoch.
+
+    Without a discontinuity anchor the post-restart segment (small MPEGTS)
+    would be spliced back before the pre-restart wraparound.  The anchor
+    pins the restarted segment to a later absolute position so cues stay
+    ordered across the boundary, with no adjacency window applied.
+    """
+    new_epoch = 10 * MODULUS + 5000
+    payload = {
+        "anchorTicks": 8589930000,
+        "maxAnchorIntervalTicks": 900000,
+        "discontinuityAnchors": [{"sequence": 1, "anchorTicks": new_epoch}],
+        "segments": [
+            {"sequence": 0, "content": _segment(
+                "00:00:00.000", 8589930000,
+                [("00:00:00.000", "00:00:00.400", "before restart")])},
+            # Fresh epoch: MPEGTS restarts at 5000, far outside the old
+            # adjacency window (which would otherwise fail to connect it).
+            {"sequence": 1, "content": _segment(
+                "00:00:00.000", 5000,
+                [("00:00:00.200", "00:00:01.200", "after restart")])},
+        ],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+    cues = body["cues"]
+    _assert([c["text"] for c in cues] == ["before restart", "after restart"], cues)
+    _assert(cues[1]["startTicks"] == new_epoch + 18000, cues[1])
+    _assert(cues[0]["endTicks"] < cues[1]["startTicks"], "restart must not reorder cues")
+    return "encoder-restart sample keeps cues ordered across the fresh MPEGTS epoch"
+
+
+def smoke_restart_congruence_mismatch() -> str:
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "discontinuityAnchors": [{"sequence": 1, "anchorTicks": 2 * MODULUS}],
+        "segments": [
+            {"sequence": 0, "content": _segment("00:00:00.000", 0, [])},
+            {"sequence": 1, "content": _segment("00:00:00.000", 12345, [])},
+        ],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "ANCHOR_INCOMPATIBLE" and error["segment"] == 1, error)
+    return "non-congruent restart anchor returns ANCHOR_INCOMPATIBLE with the segment"
+
+
+def smoke_restart_target_missing() -> str:
+    payload = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "discontinuityAnchors": [{"sequence": 9, "anchorTicks": MODULUS}],
+        "segments": [{"sequence": 0, "content": _segment("00:00:00.000", 0, [])}],
+    }
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "ANCHOR_TARGET_NOT_FOUND" and error["segment"] == 9, error)
+    return "restart anchor at a missing segment returns ANCHOR_TARGET_NOT_FOUND"
+
+
+def smoke_restart_anchor_field_invalid() -> str:
+    base = {
+        "anchorTicks": 0,
+        "maxAnchorIntervalTicks": 90000,
+        "segments": [
+            {"sequence": 0, "content": _segment("00:00:00.000", 0, [])},
+            {"sequence": 1, "content": _segment("00:00:00.000", 0, [])},
+        ],
+    }
+
+    bad_payloads = [
+        # not an array
+        dict(base, discontinuityAnchors={"sequence": 1, "anchorTicks": 0}),
+        # targets the first segment
+        dict(base, discontinuityAnchors=[{"sequence": 0, "anchorTicks": 0}]),
+        # negative anchorTicks
+        dict(base, discontinuityAnchors=[{"sequence": 1, "anchorTicks": -1}]),
+        # sequences not strictly increasing
+        dict(base, discontinuityAnchors=[
+            {"sequence": 1, "anchorTicks": MODULUS},
+            {"sequence": 1, "anchorTicks": 2 * MODULUS},
+        ]),
+    ]
+    for payload in bad_payloads:
+        status, body = _request("POST", "/api/subtitles/normalize", payload)
+        _assert(status == 400, f"expected 400, got {status}: {body}")
+        _assert(body["error"]["code"] == "INVALID_REQUEST", body["error"])
+    return "malformed discontinuityAnchors fields return INVALID_REQUEST"
+
+
 # ---------------------------------------------------------------- helpers
 
 def _request(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -160,6 +255,10 @@ def main() -> int:
         ("smoke: invalid header", smoke_invalid_header),
         ("smoke: anchor incompatible", smoke_anchor_incompatible),
         ("smoke: ambiguous unwrap", smoke_ambiguous_unwrap),
+        ("smoke: encoder restart", smoke_encoder_restart),
+        ("smoke: restart congruence mismatch", smoke_restart_congruence_mismatch),
+        ("smoke: restart target missing", smoke_restart_target_missing),
+        ("smoke: restart anchor field invalid", smoke_restart_anchor_field_invalid),
     ]
     print(f"verify: targeting app at {BASE_URL}", flush=True)
     failures = 0
