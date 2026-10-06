@@ -1,7 +1,7 @@
 import unittest
 
 from app.errors import ApiError
-from app.normalize import SegmentInput, normalize_segments, unwrap_map_positions
+from app.normalize import DiscontinuityAnchor, SegmentInput, normalize_segments, unwrap_map_positions
 from app.webvtt import MPEGTS_MODULUS as MOD, parse_segment
 
 
@@ -52,6 +52,102 @@ class UnwrapTest(unittest.TestCase):
         segments = [make_segment(0, 100), make_segment(1, MOD - 5)]
         expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
                     100, 1000, segments)
+
+
+class DiscontinuityUnwrapTest(unittest.TestCase):
+    def test_anchor_opens_new_section_without_interval_window(self):
+        # After a restart the MPEGTS counter resets to a small value.  The gap
+        # between 9 000 000 and 100 vastly exceeds maxAnchorIntervalTicks, yet
+        # the declared anchor pins segment 1 absolutely and no window applies.
+        segments = [
+            make_segment(0, 9_000_000),
+            make_segment(1, 100),
+            make_segment(2, 100_000),
+        ]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=2 * MOD + 100)]
+        positions = unwrap_map_positions(9_000_000, 180_000, segments, anchors)
+        self.assertEqual(positions, [9_000_000, 2 * MOD + 100, 2 * MOD + 100_000])
+
+    def test_section_internal_unwrap_still_uses_window(self):
+        # Segments 1 and 2 live in the same restarted epoch and wrap once.
+        segments = [
+            make_segment(0, 5_000),
+            make_segment(1, MOD - 90),
+            make_segment(2, 90),
+        ]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=3 * MOD + MOD - 90)]
+        positions = unwrap_map_positions(5_000, 90_000, segments, anchors)
+        self.assertEqual(positions, [5_000, 4 * MOD - 90, 4 * MOD + 90])
+
+    def test_section_internal_gap_still_incompatible(self):
+        segments = [
+            make_segment(0, 0),
+            make_segment(1, 200),
+            make_segment(2, 9_000_000),
+        ]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=2 * MOD + 200)]
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+                          0, 90_000, segments, anchors)
+        self.assertEqual(err.segment, 2)
+
+    def test_section_internal_ambiguity_still_rejected(self):
+        segments = [
+            make_segment(0, 0),
+            make_segment(1, 100),
+            make_segment(2, MOD // 2),
+        ]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=2 * MOD + 100)]
+        err = expect_code(self, "UNWRAP_NOT_UNIQUE", unwrap_map_positions,
+                          0, MOD // 2 + 100, segments, anchors)
+        self.assertEqual(err.segment, 2)
+
+    def test_declared_anchor_must_be_congruent_with_target(self):
+        segments = [make_segment(0, 0), make_segment(1, 100)]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=2 * MOD + 101)]
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+                          0, 90_000, segments, anchors)
+        self.assertEqual(err.segment, 1)
+
+    def test_declared_anchor_must_be_later_than_previous_map_point(self):
+        segments = [make_segment(0, 5_000), make_segment(1, 100)]
+        # Congruent with segment 1 but not strictly later than segment 0's point.
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=100)]
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+                          5_000, 90_000, segments, anchors)
+        self.assertEqual(err.segment, 1)
+
+    def test_equal_declared_anchor_is_regression(self):
+        segments = [make_segment(0, 100), make_segment(1, 100)]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=100)]
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", unwrap_map_positions,
+                          100, 90_000, segments, anchors)
+        self.assertEqual(err.segment, 1)
+
+    def test_multiple_sections(self):
+        segments = [
+            make_segment(0, 10),
+            make_segment(1, 20),
+            make_segment(2, 30),
+            make_segment(3, 40),
+        ]
+        anchors = [
+            DiscontinuityAnchor(segment_index=1, anchor_ticks=MOD + 20),
+            DiscontinuityAnchor(segment_index=3, anchor_ticks=5 * MOD + 40),
+        ]
+        positions = unwrap_map_positions(10, 90_000, segments, anchors)
+        self.assertEqual(positions, [10, MOD + 20, MOD + 30, 5 * MOD + 40])
+
+    def test_restart_sample_keeps_cues_ordered(self):
+        segments = [
+            make_segment(0, 8_000_000_000, cues=[("00:00:00.000", "00:00:01.000", "before restart")]),
+            make_segment(1, 100, cues=[("00:00:00.000", "00:00:01.000", "after restart")]),
+        ]
+        anchors = [DiscontinuityAnchor(segment_index=1, anchor_ticks=MOD + 100)]
+        cues = normalize_segments(8_000_000_000, 90_000, segments, anchors)
+        self.assertEqual([c.text for c in cues], ["before restart", "after restart"])
+        self.assertEqual(cues[0].start_ticks, 8_000_000_000)
+        self.assertEqual(cues[1].start_ticks, MOD + 100)
+        self.assertLess(cues[0].end_ticks, cues[1].start_ticks)
 
 
 class NormalizeTest(unittest.TestCase):

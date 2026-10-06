@@ -125,6 +125,74 @@ def smoke_ambiguous_unwrap() -> str:
     return "ambiguous unwrap returns UNWRAP_NOT_UNIQUE"
 
 
+def smoke_encoder_restart() -> str:
+    """An encoder restart resets the 33-bit MPEGTS epoch.
+
+    Segments 0-1 run near the 2**33 boundary; segment 2 restarts with a
+    small MPEGTS value.  Without a discontinuity anchor the reset value
+    cannot be attached to the pre-restart chain; with the anchor it opens a
+    new section and cues stay in a decidable before/after order.
+    """
+    segments = [
+        {"sequence": 0, "content": _segment("00:00:00.000", 8_000_000_000,
+                                            [("00:00:00.000", "00:00:01.000", "before restart")])},
+        {"sequence": 1, "content": _segment("00:00:00.000", 8_000_090_000, [])},
+        {"sequence": 2, "content": _segment("00:00:00.000", 100,
+                                            [("00:00:00.000", "00:00:01.000", "after restart")])},
+        {"sequence": 3, "content": _segment("00:00:00.000", 90_100, [])},
+    ]
+
+    # Without an anchor the restarted epoch must not be spliced onto the
+    # pre-restart wraparound chain.
+    plain = {"anchorTicks": 8_000_000_000, "maxAnchorIntervalTicks": 900_000, "segments": segments}
+    status, body = _request("POST", "/api/subtitles/normalize", plain)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "ANCHOR_INCOMPATIBLE" and error["segment"] == 2, error)
+
+    payload = dict(plain)
+    payload["discontinuityAnchors"] = [{"sequence": 2, "anchorTicks": MODULUS + 100}]
+    status, body = _request("POST", "/api/subtitles/normalize", payload)
+    _assert(status == 200, f"expected 200, got {status}: {body}")
+    cues = body["cues"]
+    _assert([c["text"] for c in cues] == ["before restart", "after restart"], f"bad order: {cues}")
+    before, after = cues
+    _assert(before["startTicks"] == 8_000_000_000 and before["endTicks"] == 8_000_090_000, before)
+    _assert(after["startTicks"] == MODULUS + 100 and after["endTicks"] == MODULUS + 90_100, after)
+    _assert(before["endTicks"] < after["startTicks"], "cues across a restart must stay ordered")
+    return "encoder restart sample opens a new epoch section without splicing the old chain"
+
+
+def smoke_discontinuity_anchor_errors() -> str:
+    segments = [
+        {"sequence": 0, "content": _segment("00:00:00.000", 8_000_000_000, [])},
+        {"sequence": 1, "content": _segment("00:00:00.000", 8_000_090_000, [])},
+        {"sequence": 2, "content": _segment("00:00:00.000", 100, [])},
+    ]
+    base = {"anchorTicks": 8_000_000_000, "maxAnchorIntervalTicks": 900_000, "segments": segments}
+
+    missing = dict(base, discontinuityAnchors=[{"sequence": 9, "anchorTicks": MODULUS + 100}])
+    status, body = _request("POST", "/api/subtitles/normalize", missing)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "ANCHOR_TARGET_NOT_FOUND" and error["segment"] == 9, error)
+
+    incongruent = dict(base, discontinuityAnchors=[{"sequence": 2, "anchorTicks": MODULUS + 101}])
+    status, body = _request("POST", "/api/subtitles/normalize", incongruent)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    error = body["error"]
+    _assert(error["code"] == "ANCHOR_INCOMPATIBLE" and error["segment"] == 2, error)
+
+    reversed_order = dict(base, discontinuityAnchors=[
+        {"sequence": 2, "anchorTicks": MODULUS + 100},
+        {"sequence": 1, "anchorTicks": 8_000_180_000},
+    ])
+    status, body = _request("POST", "/api/subtitles/normalize", reversed_order)
+    _assert(status == 400, f"expected 400, got {status}: {body}")
+    _assert(body["error"]["code"] == "INVALID_REQUEST", body)
+    return "invalid discontinuity anchors return stable codes with the offending segment"
+
+
 # ---------------------------------------------------------------- helpers
 
 def _request(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -160,6 +228,8 @@ def main() -> int:
         ("smoke: invalid header", smoke_invalid_header),
         ("smoke: anchor incompatible", smoke_anchor_incompatible),
         ("smoke: ambiguous unwrap", smoke_ambiguous_unwrap),
+        ("smoke: encoder restart", smoke_encoder_restart),
+        ("smoke: discontinuity anchor errors", smoke_discontinuity_anchor_errors),
     ]
     print(f"verify: targeting app at {BASE_URL}", flush=True)
     failures = 0

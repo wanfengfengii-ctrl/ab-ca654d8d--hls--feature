@@ -3,7 +3,9 @@
 直播归档场景下，HLS 分段 WebVTT 字幕通过 `X-TIMESTAMP-MAP` 绑定到 33 位
 MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPEGTS 排序会让
 字幕跳回节目开头。本服务把一组连续分段的字幕还原到统一的绝对 90 kHz
-时间轴上，跨回绕边界的字幕仍保持连续先后关系。
+时间轴上，跨回绕边界的字幕仍保持连续先后关系。编码器重启会开启新的
+MPEGTS 纪元，可通过 `discontinuityAnchors` 在指定分段声明绝对锚点，把
+重启后的区段接回统一时间轴，而不会误接到重启前的回绕链上。
 
 仅依赖 Python 标准库，镜像构建无需访问包管理源。
 
@@ -20,6 +22,9 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `segments` | 数组，1–64 个 | 字幕段，序号必须连续 |
 | `segments[].sequence` | 整数 ≥ 0 | 段序号 |
 | `segments[].content` | 字符串 | UTF-8 WebVTT 文本；全部段合计 ≤ 1 MiB |
+| `discontinuityAnchors` | 数组，可省略，最多 8 项 | 编码器重启断点；省略时全部既有行为保持不变 |
+| `discontinuityAnchors[].sequence` | 整数 ≥ 0 | 断点所在段的序号，须严格递增、不得重复、不得指向首段且必须存在于 `segments` |
+| `discontinuityAnchors[].anchorTicks` | 整数 ≥ 0 | 该段映射点在绝对 90 kHz 时间轴上的位置，须满足 `anchorTicks ≡ MPEGTSₛ (mod 2³³)` |
 
 每个分段必须恰含一个位于头部块（首个空行之前）的
 `X-TIMESTAMP-MAP=LOCAL:<毫秒时间>,MPEGTS:<0..2³³-1>`。
@@ -46,6 +51,20 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 - 窗口内没有候选 → `ANCHOR_INCOMPATIBLE`；多于一个候选 → `UNWRAP_NOT_UNIQUE`；
 - 提示的绝对 tick = 段映射点位置 +（提示本地毫秒 − 映射 LOCAL 毫秒）× 90。
 
+### 编码器重启（discontinuityAnchors）
+
+编码器重启后 MPEGTS 计数器从新的纪元重新开始，新的 33 位取值可能与
+重启前的某个回绕候选相同，从而被误接到重启前的链路上。每个
+`discontinuityAnchors` 条目在其声明段开启一个新的连续区段：
+
+- 声明段的映射点直接钉在 `anchorTicks` 上，**不**套用与上一段的
+  `maxAnchorIntervalTicks` 相邻间隔窗口（跨断点不做相邻衔接）；
+- 区段内部（声明段到下一个声明段之间）仍按上面的唯一展开规则处理；
+- 新锚点必须**严格晚于**上一段已确定的映射点，否则时间轴倒退，
+  返回 `ANCHOR_INCOMPATIBLE` 并携带该段序号；
+- 锚点与目标段 MPEGTS 不同余 → `ANCHOR_INCOMPATIBLE`；目标段不存在 →
+  `ANCHOR_TARGET_NOT_FOUND`，响应均携带对应段序号。
+
 ### 错误响应
 
 统一为 `400`，携带稳定错误码与（适用时的）段序号：
@@ -68,7 +87,8 @@ MPEG-TS（90 kHz）时钟。当时钟回绕（越过 2³³）后，直接按 MPE
 | `MPEGTS_OUT_OF_RANGE` | MPEGTS 超出 33 位范围（0..8589934591） |
 | `CUE_TIMING_INVALID` | 提示块缺少或存在非法的 `-->` 计时行 |
 | `CUE_INTERVAL_INVALID` | 提示结束时间不大于开始时间 |
-| `ANCHOR_INCOMPATIBLE` | 锚点与首段 MPEGTS 不同余，或相邻段间隔超出上限无法衔接 |
+| `ANCHOR_INCOMPATIBLE` | 锚点与目标段 MPEGTS 不同余、相邻段间隔超出上限无法衔接，或不连续锚点导致时间倒退 |
+| `ANCHOR_TARGET_NOT_FOUND` | `discontinuityAnchors` 指向不存在的段序号 |
 | `UNWRAP_NOT_UNIQUE` | 回绕展开存在多个候选，无法唯一确定 |
 
 ### `GET /healthz`
@@ -85,8 +105,8 @@ APP_PORT=9090 docker compose up app    # 宿主机端口由环境变量配置
 ## 验证（一次性 verify 服务）
 
 `verify` 服务在应用健康检查后启动，依次执行：构建检查（全部源文件字节
-码编译）、单元测试、API 冒烟（含 2³³ 回绕样例与稳定错误码断言），并以
-退出码报告结果：
+码编译）、单元测试、API 冒烟（含 2³³ 回绕样例、编码器重启样例与稳定错误
+码断言），并以退出码报告结果：
 
 ```bash
 docker compose up --build --exit-code-from verify verify

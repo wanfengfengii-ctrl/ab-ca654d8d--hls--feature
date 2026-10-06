@@ -2,6 +2,7 @@ import unittest
 
 from app.errors import ApiError
 from app.service import MAX_PAYLOAD_BYTES, MAX_SEGMENTS, normalize_request
+from app.webvtt import MPEGTS_MODULUS as MOD
 
 
 def segment(mpegts, local="00:00:00.000", cues=()):
@@ -115,6 +116,109 @@ class NormalizeRequestTest(unittest.TestCase):
                           request([(0, segment(0)), (1, segment(1 << 32))],
                                   anchor=1 << 33, interval=1 << 32))
         self.assertEqual(err.segment, 1)
+
+
+class DiscontinuityRequestTest(unittest.TestCase):
+    def anchors_request(self, anchors, segs=None, anchor=0, interval=90_000):
+        body = request(segs or [(i, segment(i % MOD)) for i in range(4)],
+                       anchor=anchor, interval=interval)
+        body["discontinuityAnchors"] = anchors
+        return body
+
+    def test_omitted_keeps_existing_behavior(self):
+        body = request([(0, segment(0, cues=[("00:00:00.000", "00:00:01.000", "x")])),
+                        (1, segment(90000))])
+        result = normalize_request(body)
+        self.assertEqual(result["cues"][0]["startTicks"], 0)
+
+    def test_restart_end_to_end(self):
+        body = self.anchors_request(
+            [{"sequence": 2, "anchorTicks": 2 * MOD + 200}],
+            segs=[
+                (0, segment(0, cues=[("00:00:00.000", "00:00:01.000", "old epoch")])),
+                (1, segment(90000)),
+                (2, segment(200, cues=[("00:00:00.000", "00:00:01.000", "new epoch")])),
+                (3, segment(200 + 90000)),
+            ],
+        )
+        result = normalize_request(body)
+        new_epoch = [c for c in result["cues"] if c["text"] == "new epoch"][0]
+        self.assertEqual(new_epoch["startTicks"], 2 * MOD + 200)
+        self.assertEqual(new_epoch["segment"], 2)
+
+    def test_field_must_be_an_array(self):
+        body = self.anchors_request({"sequence": 1, "anchorTicks": MOD + 1})
+        expect_code(self, "INVALID_REQUEST", body)
+
+    def test_at_most_eight_entries(self):
+        segs = [(i, segment(i)) for i in range(10)]
+        body = self.anchors_request(
+            [{"sequence": i, "anchorTicks": MOD * i + i} for i in range(1, 10)], segs=segs
+        )
+        expect_code(self, "INVALID_REQUEST", body)
+
+    def test_eight_entries_are_accepted(self):
+        segs = [(i, segment(i)) for i in range(9)]
+        body = self.anchors_request(
+            [{"sequence": i, "anchorTicks": MOD * i + i} for i in range(1, 9)], segs=segs
+        )
+        result = normalize_request(body)
+        self.assertIn("cues", result)
+
+    def test_sequences_must_be_strictly_increasing(self):
+        body = self.anchors_request(
+            [{"sequence": 3, "anchorTicks": 3 * MOD + 3},
+             {"sequence": 2, "anchorTicks": 2 * MOD + 2}]
+        )
+        err = expect_code(self, "INVALID_REQUEST", body)
+        self.assertEqual(err.segment, 2)
+
+    def test_duplicate_anchor_sequences_are_rejected(self):
+        body = self.anchors_request(
+            [{"sequence": 2, "anchorTicks": 2 * MOD + 2},
+             {"sequence": 2, "anchorTicks": 3 * MOD + 2}]
+        )
+        err = expect_code(self, "INVALID_REQUEST", body)
+        self.assertEqual(err.segment, 2)
+
+    def test_anchor_must_not_target_first_segment(self):
+        body = self.anchors_request([{"sequence": 0, "anchorTicks": 0}])
+        err = expect_code(self, "INVALID_REQUEST", body)
+        self.assertEqual(err.segment, 0)
+
+    def test_anchor_target_must_exist(self):
+        body = self.anchors_request([{"sequence": 99, "anchorTicks": MOD + 99}])
+        err = expect_code(self, "ANCHOR_TARGET_NOT_FOUND", body)
+        self.assertEqual(err.segment, 99)
+
+    def test_non_integer_anchor_sequence(self):
+        body = self.anchors_request([{"sequence": "2", "anchorTicks": 2 * MOD + 2}])
+        expect_code(self, "INVALID_REQUEST", body)
+
+    def test_negative_anchor_sequence(self):
+        body = self.anchors_request([{"sequence": -1, "anchorTicks": MOD - 1}])
+        expect_code(self, "INVALID_REQUEST", body)
+
+    def test_anchor_ticks_must_be_non_negative_integer(self):
+        body = self.anchors_request([{"sequence": 2, "anchorTicks": -1}])
+        err = expect_code(self, "INVALID_REQUEST", body)
+        self.assertEqual(err.segment, 2)
+
+    def test_anchor_congruence_failure_carries_segment(self):
+        body = self.anchors_request(
+            [{"sequence": 2, "anchorTicks": 2 * MOD + 201}],
+            segs=[(0, segment(0)), (1, segment(90000)), (2, segment(200))],
+        )
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", body)
+        self.assertEqual(err.segment, 2)
+
+    def test_anchor_regression_failure_carries_segment(self):
+        body = self.anchors_request(
+            [{"sequence": 2, "anchorTicks": 200}],
+            segs=[(0, segment(0)), (1, segment(90000)), (2, segment(200))],
+        )
+        err = expect_code(self, "ANCHOR_INCOMPATIBLE", body)
+        self.assertEqual(err.segment, 2)
 
 
 if __name__ == "__main__":
